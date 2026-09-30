@@ -1,10 +1,11 @@
-exec.o: fs/exec.c include/linux/kconfig.h include/generated/autoconf.h \
-  include/linux/compiler_types.h include/linux/compiler-clang.h \
-  include/linux/slab.h include/linux/gfp.h include/linux/mmdebug.h \
-  include/linux/bug.h arch/arm64/include/asm/bug.h \
-  include/linux/stringify.h arch/arm64/include/asm/asm-bug.h \
-  arch/arm64/include/asm/brk-imm.h include/asm-generic/bug.h \
-  include/linux/compiler.h include/uapi/linux/types.h \
+fs/.tmp_exec.o: fs/exec.c include/linux/kconfig.h \
+  include/generated/autoconf.h include/linux/compiler_types.h \
+  include/linux/compiler-clang.h include/linux/slab.h \
+  include/linux/gfp.h include/linux/mmdebug.h include/linux/bug.h \
+  arch/arm64/include/asm/bug.h include/linux/stringify.h \
+  arch/arm64/include/asm/asm-bug.h arch/arm64/include/asm/brk-imm.h \
+  include/asm-generic/bug.h include/linux/compiler.h \
+  include/uapi/linux/types.h \
   arch/arm64/include/generated/uapi/asm/types.h \
   include/uapi/asm-generic/types.h include/asm-generic/int-ll64.h \
   include/uapi/asm-generic/int-ll64.h \
