@@ -1,0 +1,270 @@
+name: Build Kernel A135F
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "arch/**"
+      - "drivers/**"
+      - "kernel/**"
+      - "net/**"
+      - "fs/**"
+      - "mm/**"
+      - ".config"
+      - "build_kernel.sh"
+
+env:
+  BUILD_DIR: build_output
+  CCACHE_DIR: ~/.ccache
+  CCACHE_MAXSIZE: 5G
+  TOOLCHAIN_CLANG: toolchain/clang/host/linux-x86/clang-r383902/bin
+  TOOLCHAIN_GCC: toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      kernel-version: ${{ steps.extract-version.outputs.kernel-version }}
+      build-duration: ${{ steps.build-timing.outputs.duration }}
+      build-status: ${{ job.status }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+
+      - name: Initialize build environment
+        id: build-timing
+        run: |
+          echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
+          echo "START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          mkdir -p "${{ env.BUILD_DIR }}"
+          mkdir -p "${{ env.CCACHE_DIR }}"
+
+      - name: Check disk space
+        run: |
+          df -h /
+          df -i /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git make bc bison flex libssl-dev libelf-dev \
+            python3 zip unzip ccache dpkg-dev
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-a135f-${{ hashFiles('.config') }}
+          restore-keys: |
+            ccache-a135f-
+
+      - name: Configure toolchain
+        id: toolchain-config
+        run: |
+          export PATH="${{ env.TOOLCHAIN_CLANG }}:${{ env.TOOLCHAIN_GCC }}:$PATH"
+          which clang || { echo "❌ clang not found"; exit 1; }
+          which aarch64-linux-android-gcc || { echo "❌ aarch64-linux-android-gcc not found"; exit 1; }
+          clang --version
+          aarch64-linux-android-gcc --version
+          echo "TOOLCHAIN_PATH=$PATH" >> $GITHUB_ENV
+
+      - name: Build kernel
+        id: kernel-build
+        run: |
+          set -e
+          export USE_CCACHE=1
+          export CCACHE_BASEDIR="${PWD}"
+          export CCACHE_SLOPPINESS=file_macro,time_macros
+          export PATH="${{ env.TOOLCHAIN_PATH }}"
+          chmod +x build_kernel.sh
+          ./build_kernel.sh || { echo "❌ Kernel build failed"; exit 1; }
+          ccache -s
+
+      - name: Extract kernel version
+        id: extract-version
+        run: |
+          KVER=$(cat include/config/kernel.release 2>/dev/null || \
+                 make ARCH=arm64 kernelversion 2>/dev/null || \
+                 echo "unknown")
+          echo "kernel-version=$KVER" >> $GITHUB_OUTPUT
+          echo "KERNEL_VERSION=$KVER" >> $GITHUB_ENV
+
+      - name: Verify kernel build output
+        id: verify-build
+        run: |
+          VMLINUX_PATH="vmlinux"
+          IMAGE_PATH="arch/arm64/boot/Image"
+          [ -f "$VMLINUX_PATH" ] && echo "✓ vmlinux found ($(du -h "$VMLINUX_PATH" | cut -f1))" || echo "⚠ vmlinux not found"
+          [ -f "$IMAGE_PATH" ] && echo "✓ Image found ($(du -h "$IMAGE_PATH" | cut -f1))" || echo "⚠ Image not found"
+          [ -d "output/built" ] && find output/built -type f -exec ls -lh {} \; 2>/dev/null || echo "No artifacts yet"
+
+      - name: Download magiskboot
+        id: download-magiskboot
+        run: |
+          set -e
+          MAGISK_VERSION="v30.7"
+          gh release download "${MAGISK_VERSION}" \
+            --repo topjohnwu/Magisk \
+            --pattern "Magisk-${MAGISK_VERSION}.apk" \
+            --output "Magisk.apk" 2>&1
+          [ ! -f "Magisk.apk" ] && { echo "❌ Failed to download Magisk"; exit 1; }
+          mkdir -p .magisk-extract
+          unzip -q -o "Magisk.apk" "lib/x86_64/libmagiskboot.so" -d .magisk-extract || { echo "❌ Failed to extract libmagiskboot.so"; exit 1; }
+          [ -f ".magisk-extract/lib/x86_64/libmagiskboot.so" ] && { mv ".magisk-extract/lib/x86_64/libmagiskboot.so" magiskboot; chmod +x magiskboot; echo "MAGISKBOOT_PATH=$PWD/magiskboot" >> $GITHUB_ENV; } || { echo "❌ libmagiskboot.so not found"; exit 1; }
+          rm -rf .magisk-extract
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Pack boot.img
+        id: pack-boot
+        run: |
+          set -e
+          mkdir -p output
+          cd output
+          [ ! -f "publish.sh" ] && { echo "⚠ publish.sh not found"; exit 1; }
+          cp ../magiskboot .
+          export PATH="$PWD:$PATH"
+          chmod +x publish.sh
+          ./publish.sh || { echo "❌ boot.img packing failed"; exit 1; }
+          [ -d "built" ] && { ls -lh built/; du -sh built/; }
+
+      - name: Collect build artifacts
+        id: collect-artifacts
+        if: always()
+        run: |
+          ARTIFACTS_DIR="${{ env.BUILD_DIR }}/artifacts"
+          mkdir -p "$ARTIFACTS_DIR"
+          [ -d "output/built" ] && cp -v output/built/*.img "$ARTIFACTS_DIR/" 2>/dev/null || true
+          IMG=$(find "$ARTIFACTS_DIR" -name "*.img" -type f -print -quit)
+          if [ -n "$IMG" ]; then
+            echo "OUTPUT_IMG=$IMG" >> $GITHUB_ENV
+            echo "OUTPUT_SIZE=$(du -h "$IMG" | cut -f1)" >> $GITHUB_ENV
+            echo "artifact-found=true" >> $GITHUB_OUTPUT
+          else
+            echo "artifact-found=false" >> $GITHUB_OUTPUT
+          fi
+          cat > "$ARTIFACTS_DIR/BUILD_MANIFEST.txt" << MANIFEST
+          Build Date: $(date -u +%Y-%m-%d\ %H:%M:%SZ)
+          Kernel Version: ${{ env.KERNEL_VERSION }}
+          Commit SHA: ${{ github.sha }}
+          Commit Branch: ${{ github.ref_name }}
+          Runner: ${{ runner.os }} (${{ runner.arch }})
+          MANIFEST
+
+      - name: Calculate build metrics
+        id: build-metrics
+        if: always()
+        run: |
+          BUILD_END=$(date +%s)
+          DURATION=$(( BUILD_END - ${{ env.BUILD_START }} ))
+          MINS=$(( DURATION / 60 ))
+          SECS=$(( DURATION % 60 ))
+          echo "duration=${MINS}m ${SECS}s" >> $GITHUB_OUTPUT
+          echo "duration_seconds=$DURATION" >> $GITHUB_OUTPUT
+          echo "Total build time: ${MINS}m ${SECS}s"
+          echo "Build status: ${{ job.status }}"
+          df -h /
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-a135f
+          path: ${{ env.BUILD_DIR }}/artifacts/
+          retention-days: 30
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Cleanup ccache
+        if: always()
+        run: |
+          ccache -c --max-size 5G
+          ccache -s
+
+      - name: Cleanup build artifacts
+        if: always()
+        run: |
+          rm -f Magisk.apk magiskboot
+          rm -rf .magisk-extract
+          [ "${{ secrets.CLEANUP_BUILD_DIR }}" = "true" ] && make ARCH=arm64 clean 2>/dev/null || true
+
+      - name: Generate build report
+        if: always()
+        run: |
+          REPORT_FILE="${{ env.BUILD_DIR }}/BUILD_REPORT.md"
+          cat > "$REPORT_FILE" << 'EOF'
+          # Kernel Build Report - A135F
+
+          ## Build Information
+          - **Status**: ${{ job.status }}
+          - **Build Date**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          - **Kernel Version**: ${{ env.KERNEL_VERSION }}
+          - **Build Duration**: ${{ steps.build-metrics.outputs.duration }}
+
+          ## Commit Details
+          - **SHA**: ${{ github.sha }}
+          - **Branch**: ${{ github.ref_name }}
+          - **Message**: ${{ github.event.head_commit.message }}
+
+          ## Build Artifacts
+          - **Status**: ${{ steps.collect-artifacts.outputs.artifact-found }}
+          - **Output Image**: ${{ env.OUTPUT_IMG }}
+          - **Size**: ${{ env.OUTPUT_SIZE }}
+
+          ## Build Environment
+          - **Runner**: ${{ runner.os }} ${{ runner.arch }}
+          - **Workflow**: ${{ github.workflow }}
+          - **Run ID**: ${{ github.run_id }}
+          EOF
+          cat "$REPORT_FILE"
+
+      - name: Check build success
+        if: always()
+        run: |
+          [ "${{ job.status }}" = "success" ] && { echo "✅ Build completed successfully"; exit 0; } || { echo "❌ Build failed"; exit 1; }
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Clean old artifacts
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          name: build-logs-a135f
+          failOnError: false
+
+  report:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Generate job summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🔨 Kernel Build Summary - A135F
+
+          | Metric | Value |
+          |--------|-------|
+          | Status | ${{ needs.build.outputs.build-status }} |
+          | Kernel Version | ${{ needs.build.outputs.kernel-version }} |
+          | Build Duration | ${{ needs.build.outputs.build-duration }} |
+          | Commit | `${{ github.sha }}` |
+          | Branch | ${{ github.ref_name }} |
+
+          ### Artifacts
+          - Check the **Artifacts** section above to download build outputs
+          - Kernel artifacts retained for 30 days
+          - Build logs retained for 7 days
+          EOF
+
+      - name: Verify build health
+        run: |
+          [ "${{ needs.build.outputs.build-status }}" = "success" ] && echo "✅ All systems operational" || echo "⚠️  Build encountered issues - review logs"
