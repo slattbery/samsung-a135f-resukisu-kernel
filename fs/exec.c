@@ -1939,28 +1939,13 @@ int do_execve_file(struct file *file, void *__argv, void *__envp)
 	return __do_execve_file(AT_FDCWD, NULL, argv, envp, 0, file);
 }
 
-#ifdef CONFIG_KSU_MANUAL_HOOK
-__attribute__((hot))
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
-extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
-				void *argv, void *envp, int *flags, int *retval);
-#endif
 int do_execve(struct filename *filename,
-	const char __user *const __user *__argv,
-	const char __user *const __user *__envp)
+	const struct user_arg_ptr __user *const __user *__argv,
+	const struct user_arg_ptr __user *const __user *__envp)
 {
-	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-#ifdef CONFIG_KSU_MANUAL_HOOK
-	int retval;
-
-	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-	retval = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
-	ksu_handle_post_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0, &retval);
-	return retval;
-#else
+	struct user_arg_ptr argv = { .ptr.native = (void __user *)__argv };
+	struct user_arg_ptr envp = { .ptr.native = (void __user *)__envp };
 	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
-#endif
 }
 
 int do_execveat(int fd, struct filename *filename,
